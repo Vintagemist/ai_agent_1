@@ -3,7 +3,7 @@
 Agent that fixes code review comments from a GitHub PR.
 
 Reads review comments (GitHub API JSON), uses an LLM to generate fixes per comment,
-applies edits to the repo, and optionally commits and pushes.
+applies edits to the repo, and optionally commits and pushes. DUMMY CHANGES
 
 Usage:
   python fix_review_agent.py --comments review-comments.json [--dry-run] [--no-push]
