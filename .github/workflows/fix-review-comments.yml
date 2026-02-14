@@ -1,5 +1,5 @@
 # Fix code review comments — runs automatically on PR review comments or manually from Actions tab
-name: agent name is Fix code review comments dummy changes
+name: agent name is Fix code review comments dummy changes only
 
 on:
   # Automatic: when a reviewer adds a line-level comment on the PR
@@ -27,8 +27,9 @@ jobs:
   fix-review-comments:
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # required for git push dummy change
-      pull-requests: write   # required for PR comments
+      contents: write      # required for git push
+      pull-requests: write # required for PR comments
+      workflows: write    # required to push commits that modify .github/workflows/*
     # For automatic runs, only run when there is a PR (skip for workflow_dispatch if branch has no PR)
     if: |
       github.event_name == 'workflow_dispatch' ||
@@ -40,7 +41,7 @@ jobs:
         with:
           # Use branch name (not SHA) so we stay on a branch and can push after applying fixes
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.branch || github.event.pull_request.head.ref }}
-          token: ${{ env.GH_TOKEN }}
+          token: ${{ secrets.PAT_TOKEN }}
 
       - name: Set PR number
         id: pr
