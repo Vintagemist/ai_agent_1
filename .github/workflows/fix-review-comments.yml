@@ -1,5 +1,5 @@
 # Fix code review comments — runs automatically on PR review comments or manually from Actions tab
-name: agent name is Fix code review comments
+name: agent name is Fix code review comments dummy changes
 
 on:
   # Automatic: when a reviewer adds a line-level comment on the PR
@@ -27,7 +27,7 @@ jobs:
   fix-review-comments:
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # required for git push
+      contents: write   # required for git push dummy change
       pull-requests: write   # required for PR comments
     # For automatic runs, only run when there is a PR (skip for workflow_dispatch if branch has no PR)
     if: |
