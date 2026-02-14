@@ -1,5 +1,5 @@
 # Fix code review comments — runs automatically on PR review comments or manually from Actions tab
-name: agent Fix code review comments
+name: agent name is Fix code review comments
 
 on:
   # Automatic: when a reviewer adds a line-level comment on the PR
