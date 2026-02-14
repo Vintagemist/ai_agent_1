@@ -1,4 +1,5 @@
 # Fix code review comments — runs automatically on PR review comments or manually from Actions tab
+# Test PR dummy change
 name: Fix code review comments
 
 on:

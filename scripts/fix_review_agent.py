@@ -18,6 +18,7 @@ import re
 import sys
 from pathlib import Path
 
+# TODO: add retry logic for API calls
 
 def load_comments(path: str) -> list[dict]:
     """Load GitHub PR review comments from a JSON file."""
