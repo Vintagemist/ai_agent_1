@@ -1,0 +1,108 @@
+# Fix code review comments — runs automatically on PR review comments or manually from Actions tab
+name: Fix code review comments
+
+on:
+  # Automatic: when a reviewer adds a line-level comment on the PR
+  pull_request_review_comment:
+    types: [created]
+  # Automatic: when a full review is submitted (e.g. "Request changes" or "Comment")
+  pull_request_review:
+    types: [submitted]
+  # Manual: run from Actions → Fix code review comments → Run workflow
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to fix (PR branch)'
+        required: true
+        default: ''
+      pr_number:
+        description: 'PR number (optional; inferred from branch if not set)'
+        required: false
+        default: ''
+
+env:
+  GH_TOKEN: ${{ secrets.GH_TOKEN || secrets.GITHUB_TOKEN }}
+
+jobs:
+  fix-review-comments:
+    runs-on: ubuntu-latest
+    # For automatic runs, only run when there is a PR (skip for workflow_dispatch if branch has no PR)
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request_review_comment' && github.event.pull_request) ||
+      (github.event_name == 'pull_request_review' && github.event.pull_request)
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.branch || github.event.pull_request.head.sha }}
+          token: ${{ env.GH_TOKEN }}
+
+      - name: Set PR number
+        id: pr
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ -n "${{ github.event.inputs.pr_number }}" ]; then
+              echo "pr_number=${{ github.event.inputs.pr_number }}" >> $GITHUB_OUTPUT
+            else
+              PR=$(gh pr list --head "${{ github.event.inputs.branch }}" --json number -q '.[0].number' 2>/dev/null || true)
+              echo "pr_number=${PR:-}" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "pr_number=${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Fetch review comments
+        id: comments
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          REPO: ${{ github.repository }}
+        run: |
+          if [ -z "$PR_NUMBER" ]; then
+            echo "No PR found for this branch."
+            echo "[]" > "$RUNNER_TEMP/review-comments.json"
+            exit 0
+          fi
+          # Fetch review comments (line-level)
+          COMMENTS=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/comments" --paginate 2>/dev/null || echo "[]")
+          echo "$COMMENTS" > "$RUNNER_TEMP/review-comments.json"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run fix agent
+        id: fix
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          echo "changes=no" >> $GITHUB_OUTPUT
+          if [ ! -s "$RUNNER_TEMP/review-comments.json" ] || [ "$(cat "$RUNNER_TEMP/review-comments.json")" = "[]" ]; then
+            echo "No review comments to process."
+            exit 0
+          fi
+          if [ -z "$OPENROUTER_API_KEY" ] && [ -z "$OPENAI_API_KEY" ]; then
+            echo "Set OPENAI_API_KEY or OPENROUTER_API_KEY as a repository secret to enable the agent."
+            exit 0
+          fi
+          python scripts/fix_review_agent.py --comments "$RUNNER_TEMP/review-comments.json" --repo-root . || true
+          if ! git diff --quiet || ! git diff --staged --quiet; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add -A
+            git commit -m "Apply fixes from code review"
+            git push
+            echo "changes=yes" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Comment on PR (optional)
+        if: steps.fix.outputs.changes == 'yes' && steps.pr.outputs.pr_number != ''
+        run: |
+          gh pr comment ${{ steps.pr.outputs.pr_number }} --body "🤖 **Code review fixes applied** — changes have been committed to this branch."
+        env:
+          GH_TOKEN: ${{ env.GH_TOKEN }}
