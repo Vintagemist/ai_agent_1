@@ -26,6 +26,9 @@ env:
 jobs:
   fix-review-comments:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write   # required for git push
+      pull-requests: write   # required for PR comments
     # For automatic runs, only run when there is a PR (skip for workflow_dispatch if branch has no PR)
     if: |
       github.event_name == 'workflow_dispatch' ||
