@@ -1,4 +1,5 @@
 # Fix code review comments — runs automatically on PR review comments or manually from Actions tab
+# Test PR dummy change
 name: Fix code review comments
 
 on:
@@ -35,7 +36,8 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.branch || github.event.pull_request.head.sha }}
+          # Use branch name (not SHA) so we stay on a branch and can push after applying fixes
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.branch || github.event.pull_request.head.ref }}
           token: ${{ env.GH_TOKEN }}
 
       - name: Set PR number
