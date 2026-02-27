@@ -100,64 +100,42 @@ jobs:
       - name: Load configuration
         if: steps.security.outputs.allowed == 'true'
         id: config
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const yaml = require('js-yaml');
+        run: |
+          # Default configuration
+          ENABLED="true"
+          MODEL="claude-opus-4-6"
+          CONFIDENCE="medium"
 
-            const defaultConfig = {
-              enabled: true,
-              triggers: {
-                keywords: ['@auto-fix', '/fix', '[auto-fix]'],
-                labels: ['auto-fix-enabled'],
-                auto_apply: false
-              },
-              ai: {
-                model: 'claude-opus-4-6',
-                confidence_threshold: 'medium'
-              },
-              limits: {
-                max_comments_per_pr: 20,
-                max_file_size_bytes: 1048576,
-                max_lines_per_comment: 100
-              }
-            };
+          # Parse YAML config if it exists
+          if [ -f ".github/auto-fix.yml" ]; then
+            echo "Loading configuration from .github/auto-fix.yml"
 
-            let config = { ...defaultConfig };
-            const configPath = '.github/auto-fix.yml';
+            # Extract values from YAML (simple grep parsing)
+            if grep -q "^enabled:" .github/auto-fix.yml; then
+              ENABLED=$(grep "^enabled:" .github/auto-fix.yml | awk '{print $2}')
+            fi
 
-            if (fs.existsSync(configPath)) {
-              try {
-                const fileContent = fs.readFileSync(configPath, 'utf8');
-                const userConfig = yaml.load(fileContent);
-                config = { ...defaultConfig, ...userConfig };
-                core.info('Loaded configuration from .github/auto-fix.yml');
-              } catch (error) {
-                core.warning(`Failed to load config file: ${error.message}. Using defaults.`);
-              }
-            } else {
-              core.info('No config file found, using defaults');
-            }
+            if grep -q "^  model:" .github/auto-fix.yml; then
+              MODEL=$(grep "^  model:" .github/auto-fix.yml | awk '{print $2}' | tr -d '"')
+            fi
 
-            // Check if agent is enabled
-            if (!config.enabled) {
-              core.warning('Auto-fix agent is disabled in configuration');
-              core.setOutput('enabled', 'false');
-              return;
-            }
+            if grep -q "^  confidence_threshold:" .github/auto-fix.yml; then
+              CONFIDENCE=$(grep "^  confidence_threshold:" .github/auto-fix.yml | awk '{print $2}' | tr -d '"')
+            fi
+          else
+            echo "No config file found, using defaults"
+          fi
 
-            core.setOutput('enabled', 'true');
-            core.setOutput('model', config.ai.model);
-            core.setOutput('confidence_threshold', config.ai.confidence_threshold);
-            core.setOutput('max_comments', config.limits.max_comments_per_pr.toString());
-            core.setOutput('auto_apply', config.triggers.auto_apply.toString());
+          # Check if agent is enabled
+          if [ "$ENABLED" != "true" ]; then
+            echo "Auto-fix agent is disabled in configuration"
+            echo "enabled=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
 
-            // Save full config for later steps
-            fs.writeFileSync(
-              process.env.RUNNER_TEMP + '/auto-fix-config.json',
-              JSON.stringify(config, null, 2)
-            );
+          echo "enabled=true" >> $GITHUB_OUTPUT
+          echo "model=$MODEL" >> $GITHUB_OUTPUT
+          echo "confidence_threshold=$CONFIDENCE" >> $GITHUB_OUTPUT
 
       - name: Set PR number and fetch comments
         if: steps.security.outputs.allowed == 'true' && steps.config.outputs.enabled == 'true'
