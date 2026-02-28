@@ -17,8 +17,19 @@ import os
 import re
 import sys
 from pathlib import Path
+from collections import defaultdict
 
 # TODO: add retry logic for API calls
+
+
+def group_comments_by_file(comments: list[dict]) -> dict[str, list[dict]]:
+    """Group comments by file path for batch processing."""
+    grouped = defaultdict(list)
+    for comment in comments:
+        path = comment.get("path")
+        if path:
+            grouped[path].append(comment)
+    return dict(grouped)
 
 def load_comments(path: str) -> list[dict]:
     """Load GitHub PR review comments from a JSON file."""
@@ -91,7 +102,119 @@ def apply_replacement_by_lines(
     return True
 
 
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+def call_llm_for_batch_fix(
+    file_path: str,
+    file_lines: list[str],
+    comments: list[dict],
+    api_key: str,
+    model: str = "claude-opus-4-6",
+) -> list[dict]:
+    """
+    Process multiple comments for a single file in one LLM call.
+    Returns a list of fixes with structure:
+    [
+      {
+        "comment_index": int,
+        "line_start": int,
+        "line_end": int,
+        "fixed_code": str,
+        "confidence": str,
+        "explanation": str
+      },
+      ...
+    ]
+    """
+    try:
+        from anthropic import Anthropic
+    except ImportError:
+        print("anthropic package required. pip install anthropic", file=sys.stderr)
+        return []
+
+    client = Anthropic(api_key=api_key)
+
+    # Build consolidated prompt
+    file_content = "".join(file_lines)
+    prompt = f"""You are fixing multiple code review comments for this file.
+
+File: {file_path}
+
+Full file content:
+```
+{file_content}
+```
+
+Review comments to address:
+"""
+
+    for i, comment in enumerate(comments, 1):
+        line = comment.get("line") or comment.get("original_line")
+        start_line = comment.get("start_line") or line
+        body = comment.get("body", "").strip()
+        prompt += f"\n{i}. Lines {start_line}-{line}: {body}"
+        diff_hunk = comment.get("diff_hunk", "").strip()
+        if diff_hunk:
+            prompt += f"\n   Diff context:\n   ```\n   {diff_hunk}\n   ```"
+
+    prompt += """
+
+Return a JSON array of fixes:
+[
+  {
+    "comment_index": <number>,
+    "line_start": <number>,
+    "line_end": <number>,
+    "fixed_code": "<replacement code>",
+    "confidence": "high|medium|low",
+    "explanation": "<brief description>"
+  },
+  ...
+]
+
+Rules:
+- Return ONLY the JSON array, no markdown fences or extra text
+- Preserve exact indentation and coding style
+- comment_index corresponds to the numbered comments above
+- If a comment doesn't require changes, omit it from the array
+- Use "high" confidence for clear fixes, "medium" for reasonable fixes, "low" for uncertain fixes"""
+
+    try:
+        response = client.messages.create(
+            model=model,
+            max_tokens=8192,  # Higher limit for batch processing
+            temperature=0.2,
+            messages=[{
+                "role": "user",
+                "content": prompt
+            }]
+        )
+
+        text = response.content[0].text.strip()
+
+        # Strip markdown code fences if present
+        if text.startswith("```json"):
+            text = text[7:]  # Remove ```json
+        elif text.startswith("```"):
+            text = text[3:]  # Remove ```
+        if text.endswith("```"):
+            text = text[:-3]  # Remove closing ```
+        text = text.strip()
+
+        # Parse JSON response
+        fixes = json.loads(text)
+
+        if not isinstance(fixes, list):
+            print(f"  Expected JSON array, got {type(fixes)}", file=sys.stderr)
+            return []
+
+        return fixes
+
+    except json.JSONDecodeError as e:
+        print(f"  Error parsing JSON response: {e}", file=sys.stderr)
+        print(f"  Raw response: {text[:200]}...", file=sys.stderr)
+        return []
+    except Exception as e:
+        print(f"  Error calling Claude API: {e}", file=sys.stderr)
+        return []
 
 
 def call_llm_for_fix(
@@ -100,22 +223,23 @@ def call_llm_for_fix(
     comment_body: str,
     diff_hunk: str,
     api_key: str,
-    model: str = "gpt-4o-mini",
-    base_url: str | None = None,
-) -> str | None:
+    model: str = "claude-opus-4-6",
+) -> tuple[str | None, str]:
     """
-    Ask the LLM for a replacement for the given line content.
-    Returns the new fragment to use, or None if no fix could be generated.
-    Supports OpenAI and OpenRouter (set base_url to OPENROUTER_BASE_URL).
+    Ask Claude for a replacement for the given line content.
+    Returns (new_fragment, confidence) or (None, "") if no fix could be generated.
+
+    Confidence levels: "high", "medium", "low"
     """
     try:
-        from openai import OpenAI
+        from anthropic import Anthropic
     except ImportError:
-        print("openai package required. pip install openai", file=sys.stderr)
-        return None
+        print("anthropic package required. pip install anthropic", file=sys.stderr)
+        return None, ""
 
-    client = OpenAI(api_key=api_key, base_url=base_url)
-    prompt = f"""You are a code review fix agent. A reviewer left a comment on this code. Your job is to return ONLY the fixed code that should replace the given snippet—no explanation, no markdown, no quotes.
+    client = Anthropic(api_key=api_key)
+
+    prompt = f"""You are a code review fix agent. A reviewer left a comment on this code.
 
 File: {file_path}
 
@@ -125,35 +249,78 @@ Code snippet (exact lines from the file):
 ```
 
 Reviewer comment:
-{comment_body}
-"""
+{comment_body}"""
+
     if diff_hunk:
         prompt += f"""
 
 Diff context (for reference):
 ```
 {diff_hunk}
-```
-"""
+```"""
 
     prompt += """
-Return ONLY the replacement code (the fixed lines). Preserve indentation and style. Do not include the triple backticks or any commentary. If no change is needed, return the exact same snippet.
-"""
 
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": "You output only the replacement code, nothing else. No markdown, no explanation."},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.2,
-    )
-    text = (response.choices[0].message.content or "").strip()
-    # Strip markdown code fence if present
-    if text.startswith("```"):
-        text = re.sub(r"^```\w*\n?", "", text)
-        text = re.sub(r"\n?```\s*$", "", text)
-    return text if text else None
+Provide your response in JSON format:
+{
+  "fixed_code": "the replacement code (preserve exact indentation and style)",
+  "confidence": "high|medium|low",
+  "explanation": "brief description of what changed"
+}
+
+Rules:
+- Return ONLY the JSON object, no markdown fences or extra text
+- Preserve exact indentation and coding style
+- If no change is needed, return the original code with confidence "low"
+- Use "high" confidence for clear, unambiguous fixes
+- Use "medium" confidence for reasonable fixes that might need review
+- Use "low" confidence for unclear or speculative fixes"""
+
+    try:
+        response = client.messages.create(
+            model=model,
+            max_tokens=4096,
+            temperature=0.2,
+            messages=[{
+                "role": "user",
+                "content": prompt
+            }]
+        )
+
+        text = response.content[0].text.strip()
+
+        # Strip markdown code fences if present
+        if text.startswith("```json"):
+            text = text[7:]  # Remove ```json
+        elif text.startswith("```"):
+            text = text[3:]  # Remove ```
+        if text.endswith("```"):
+            text = text[:-3]  # Remove closing ```
+        text = text.strip()
+
+        # Parse JSON response
+        result = json.loads(text)
+
+        fixed_code = result.get("fixed_code", "").strip()
+        confidence = result.get("confidence", "low").lower()
+        explanation = result.get("explanation", "")
+
+        if explanation:
+            print(f"  Explanation: {explanation}", file=sys.stderr)
+
+        # Validate confidence level
+        if confidence not in ["high", "medium", "low"]:
+            confidence = "low"
+
+        return fixed_code if fixed_code else None, confidence
+
+    except json.JSONDecodeError as e:
+        print(f"  Error parsing JSON response: {e}", file=sys.stderr)
+        print(f"  Raw response: {text[:200]}...", file=sys.stderr)
+        return None, ""
+    except Exception as e:
+        print(f"  Error calling Claude API: {e}", file=sys.stderr)
+        return None, ""
 
 
 def process_comments(
@@ -161,15 +328,22 @@ def process_comments(
     repo_root: str,
     api_key: str,
     dry_run: bool = False,
-    model: str = "gpt-4o-mini",
-    base_url: str | None = None,
+    model: str = "claude-opus-4-6",
+    min_confidence: str = "medium",
 ) -> int:
     """
     Process each comment: fetch context, call LLM, apply fix.
     Returns the number of comments that led to an applied fix.
+
+    min_confidence: Only apply fixes with this confidence level or higher.
+                   Options: "low", "medium", "high"
     """
     repo_root_path = Path(repo_root).resolve()
     applied = 0
+
+    # Confidence level mapping for comparison
+    confidence_levels = {"low": 0, "medium": 1, "high": 2}
+    min_confidence_value = confidence_levels.get(min_confidence.lower(), 1)
 
     for i, comment in enumerate(comments):
         path, line, end_line, body, diff_hunk = get_comment_context(comment)
@@ -193,11 +367,21 @@ def process_comments(
 
         print(f"[{i+1}] {path}:{start_line}-{end_line_use} — \"{body[:60]}...\"" if len(body) > 60 else f"[{i+1}] {path}:{start_line}-{end_line_use} — \"{body}\"", file=sys.stderr)
 
-        new_fragment = call_llm_for_fix(
-            path, snippet, body, diff_hunk, api_key, model=model, base_url=base_url
+        new_fragment, confidence = call_llm_for_fix(
+            path, snippet, body, diff_hunk, api_key, model=model
         )
+
         if not new_fragment:
+            print(f"  No fix generated", file=sys.stderr)
             continue
+
+        # Filter by confidence threshold
+        confidence_value = confidence_levels.get(confidence.lower(), 0)
+        if confidence_value < min_confidence_value:
+            print(f"  Skipped (confidence: {confidence}, required: {min_confidence})", file=sys.stderr)
+            continue
+
+        print(f"  Confidence: {confidence}", file=sys.stderr)
 
         if dry_run:
             print(f"  [dry-run] Would replace with:\n{new_fragment[:200]}...\n" if len(new_fragment) > 200 else f"  [dry-run] Would replace with:\n{new_fragment}\n", file=sys.stderr)
@@ -213,20 +397,107 @@ def process_comments(
     return applied
 
 
+def process_comments_batch(
+    comments: list[dict],
+    repo_root: str,
+    api_key: str,
+    dry_run: bool = False,
+    model: str = "claude-opus-4-6",
+    min_confidence: str = "medium",
+) -> int:
+    """
+    Process comments using batch mode - group by file and process multiple comments per file.
+    Returns the number of comments that led to an applied fix.
+    """
+    repo_root_path = Path(repo_root).resolve()
+    applied = 0
+
+    # Confidence level mapping for comparison
+    confidence_levels = {"low": 0, "medium": 1, "high": 2}
+    min_confidence_value = confidence_levels.get(min_confidence.lower(), 1)
+
+    # Group comments by file
+    grouped = group_comments_by_file(comments)
+
+    for file_path_str, file_comments in grouped.items():
+        file_path = repo_root_path / file_path_str
+
+        if not file_path.is_file():
+            print(f"Skip: file not found {file_path_str} ({len(file_comments)} comments)", file=sys.stderr)
+            continue
+
+        print(f"\n=== Processing {file_path_str} ({len(file_comments)} comment(s)) ===", file=sys.stderr)
+
+        # Read file once for all comments
+        file_lines = read_file_lines(str(file_path))
+        if not file_lines:
+            print(f"  Skip: could not read file", file=sys.stderr)
+            continue
+
+        # Process all comments for this file in one LLM call
+        fixes = call_llm_for_batch_fix(
+            file_path_str, file_lines, file_comments, api_key, model=model
+        )
+
+        if not fixes:
+            print(f"  No fixes generated", file=sys.stderr)
+            continue
+
+        # Apply fixes
+        for fix in fixes:
+            comment_idx = fix.get("comment_index", 0)
+            line_start = fix.get("line_start", 0)
+            line_end = fix.get("line_end", line_start)
+            fixed_code = fix.get("fixed_code", "")
+            confidence = fix.get("confidence", "low").lower()
+            explanation = fix.get("explanation", "")
+
+            # Validate confidence level
+            if confidence not in ["high", "medium", "low"]:
+                confidence = "low"
+
+            # Filter by confidence threshold
+            confidence_value = confidence_levels.get(confidence, 0)
+            if confidence_value < min_confidence_value:
+                print(f"  [{comment_idx}] Skipped (confidence: {confidence}, required: {min_confidence})", file=sys.stderr)
+                continue
+
+            print(f"  [{comment_idx}] Lines {line_start}-{line_end} | Confidence: {confidence}", file=sys.stderr)
+            if explanation:
+                print(f"      {explanation}", file=sys.stderr)
+
+            if dry_run:
+                print(f"      [dry-run] Would replace with:\n{fixed_code[:150]}...\n" if len(fixed_code) > 150 else f"      [dry-run] Would replace with:\n{fixed_code}\n", file=sys.stderr)
+                applied += 1
+                continue
+
+            if apply_replacement_by_lines(str(file_path), line_start, line_end, fixed_code):
+                applied += 1
+                print(f"      Applied.", file=sys.stderr)
+                # Re-read file after each change for subsequent changes
+                file_lines = read_file_lines(str(file_path))
+            else:
+                print(f"      Failed to apply.", file=sys.stderr)
+
+    return applied
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Fix code review comments using an LLM.")
+    parser = argparse.ArgumentParser(description="Fix code review comments using Claude AI.")
     parser.add_argument("--comments", required=True, help="Path to JSON file with GitHub PR review comments")
     parser.add_argument("--repo-root", default=".", help="Repository root (default: current directory)")
     parser.add_argument("--dry-run", action="store_true", help="Print proposed fixes without editing files")
-    parser.add_argument("--model", default="gpt-4o-mini", help="Model ID (default: gpt-4o-mini; use e.g. openai/gpt-4o-mini for OpenRouter)")
+    parser.add_argument("--model", default="claude-opus-4-6", help="Claude model ID (default: claude-opus-4-6)")
+    parser.add_argument("--min-confidence", default="medium", choices=["low", "medium", "high"],
+                       help="Minimum confidence level to apply fixes (default: medium)")
+    parser.add_argument("--batch", action="store_true",
+                       help="Use batch mode (process multiple comments per file in one LLM call)")
     args = parser.parse_args()
 
-    # Prefer OpenRouter if OPENROUTER_API_KEY is set; otherwise use OPENAI_API_KEY
-    api_key = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPENAI_API_KEY")
-    base_url = OPENROUTER_BASE_URL if os.environ.get("OPENROUTER_API_KEY") else None
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
 
     if not api_key:
-        print("Set OPENAI_API_KEY or OPENROUTER_API_KEY.", file=sys.stderr)
+        print("Set ANTHROPIC_API_KEY environment variable.", file=sys.stderr)
         return 1
 
     comments = load_comments(args.comments)
@@ -234,15 +505,28 @@ def main() -> int:
         print("No comments to process.", file=sys.stderr)
         return 0
 
-    applied = process_comments(
-        comments,
-        args.repo_root,
-        api_key,
-        dry_run=args.dry_run,
-        model=args.model,
-        base_url=base_url,
-    )
-    print(f"Processed {len(comments)} comment(s), applied {applied} fix(es).", file=sys.stderr)
+    if args.batch:
+        print(f"Using batch mode", file=sys.stderr)
+        applied = process_comments_batch(
+            comments,
+            args.repo_root,
+            api_key,
+            dry_run=args.dry_run,
+            model=args.model,
+            min_confidence=args.min_confidence,
+        )
+    else:
+        print(f"Using single-comment mode", file=sys.stderr)
+        applied = process_comments(
+            comments,
+            args.repo_root,
+            api_key,
+            dry_run=args.dry_run,
+            model=args.model,
+            min_confidence=args.min_confidence,
+        )
+
+    print(f"\nProcessed {len(comments)} comment(s), applied {applied} fix(es).", file=sys.stderr)
     return 0
 
 

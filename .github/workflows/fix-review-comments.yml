@@ -36,66 +36,209 @@ jobs:
       (github.event_name == 'pull_request_review_comment' && github.event.pull_request) ||
       (github.event_name == 'pull_request_review' && github.event.pull_request)
     steps:
+      - name: Security checks
+        id: security
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+
+            // For workflow_dispatch, skip security checks (assume authorized)
+            if (context.eventName === 'workflow_dispatch') {
+              core.info('Manual workflow dispatch - security checks passed');
+              core.setOutput('allowed', 'true');
+              return;
+            }
+
+            if (!pr) {
+              core.warning('No PR found in context');
+              core.setOutput('allowed', 'false');
+              return;
+            }
+
+            // Check 1: Skip if PR is from a fork
+            if (pr.head.repo.full_name !== pr.base.repo.full_name) {
+              core.warning('PR is from a fork - skipping auto-fix for security');
+              core.setOutput('allowed', 'false');
+              return;
+            }
+
+            // Check 2: Verify comment author has write access
+            const comment = context.payload.comment || context.payload.review;
+            if (comment) {
+              try {
+                const { data: permission } = await github.rest.repos.getCollaboratorPermissionLevel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  username: comment.user.login
+                });
+
+                if (!['admin', 'write'].includes(permission.permission)) {
+                  core.warning(`Comment author @${comment.user.login} lacks write access (${permission.permission}) - skipping`);
+                  core.setOutput('allowed', 'false');
+                  return;
+                }
+
+                core.info(`Comment author @${comment.user.login} has ${permission.permission} access - proceeding`);
+              } catch (error) {
+                core.warning(`Could not verify permissions for @${comment.user.login}: ${error.message}`);
+                core.setOutput('allowed', 'false');
+                return;
+              }
+            }
+
+            core.info('Security checks passed');
+            core.setOutput('allowed', 'true');
+
       - name: Checkout repository
+        if: steps.security.outputs.allowed == 'true'
         uses: actions/checkout@v4
         with:
           # Use branch name (not SHA) so we stay on a branch and can push after applying fixes
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.branch || github.event.pull_request.head.ref }}
           token: ${{ secrets.PAT_TOKEN }}
 
-      - name: Set PR number
-        id: pr
+      - name: Load configuration
+        if: steps.security.outputs.allowed == 'true'
+        id: config
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            if [ -n "${{ github.event.inputs.pr_number }}" ]; then
-              echo "pr_number=${{ github.event.inputs.pr_number }}" >> $GITHUB_OUTPUT
-            else
-              PR=$(gh pr list --head "${{ github.event.inputs.branch }}" --json number -q '.[0].number' 2>/dev/null || true)
-              echo "pr_number=${PR:-}" >> $GITHUB_OUTPUT
+          # Default configuration
+          ENABLED="true"
+          MODEL="claude-opus-4-6"
+          CONFIDENCE="medium"
+
+          # Parse YAML config if it exists
+          if [ -f ".github/auto-fix.yml" ]; then
+            echo "Loading configuration from .github/auto-fix.yml"
+
+            # Extract values from YAML (simple grep parsing)
+            if grep -q "^enabled:" .github/auto-fix.yml; then
+              ENABLED=$(grep "^enabled:" .github/auto-fix.yml | awk '{print $2}')
+            fi
+
+            if grep -q "^  model:" .github/auto-fix.yml; then
+              MODEL=$(grep "^  model:" .github/auto-fix.yml | awk '{print $2}' | tr -d '"')
+            fi
+
+            if grep -q "^  confidence_threshold:" .github/auto-fix.yml; then
+              CONFIDENCE=$(grep "^  confidence_threshold:" .github/auto-fix.yml | awk '{print $2}' | tr -d '"')
             fi
           else
-            echo "pr_number=${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
+            echo "No config file found, using defaults"
           fi
 
-      - name: Fetch review comments
-        id: comments
-        env:
-          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
-          REPO: ${{ github.repository }}
-        run: |
-          if [ -z "$PR_NUMBER" ]; then
-            echo "No PR found for this branch."
-            echo "[]" > "$RUNNER_TEMP/review-comments.json"
+          # Check if agent is enabled
+          if [ "$ENABLED" != "true" ]; then
+            echo "Auto-fix agent is disabled in configuration"
+            echo "enabled=false" >> $GITHUB_OUTPUT
             exit 0
           fi
-          # Fetch review comments (line-level)
-          COMMENTS=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/comments" --paginate 2>/dev/null || echo "[]")
-          echo "$COMMENTS" > "$RUNNER_TEMP/review-comments.json"
+
+          echo "enabled=true" >> $GITHUB_OUTPUT
+          echo "model=$MODEL" >> $GITHUB_OUTPUT
+          echo "confidence_threshold=$CONFIDENCE" >> $GITHUB_OUTPUT
+
+      - name: Set PR number and fetch comments
+        if: steps.security.outputs.allowed == 'true' && steps.config.outputs.enabled == 'true'
+        id: pr_and_comments
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            let prNumber = null;
+
+            // Determine PR number based on event type
+            if (context.eventName === 'workflow_dispatch') {
+              const inputPrNumber = '${{ github.event.inputs.pr_number }}';
+              if (inputPrNumber) {
+                prNumber = parseInt(inputPrNumber);
+              } else {
+                // Query for PR by branch name
+                const branch = '${{ github.event.inputs.branch }}';
+                if (branch) {
+                  try {
+                    const { data: prs } = await github.rest.pulls.list({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      head: `${context.repo.owner}:${branch}`,
+                      state: 'open'
+                    });
+                    if (prs.length > 0) {
+                      prNumber = prs[0].number;
+                    }
+                  } catch (error) {
+                    core.warning(`Could not find PR for branch ${branch}: ${error.message}`);
+                  }
+                }
+              }
+            } else if (context.payload.pull_request) {
+              prNumber = context.payload.pull_request.number;
+            }
+
+            core.setOutput('pr_number', prNumber ? prNumber.toString() : '');
+
+            // Fetch review comments if PR exists
+            if (!prNumber) {
+              core.info('No PR found for this branch');
+              fs.writeFileSync(path.join(process.env.RUNNER_TEMP, 'review-comments.json'), '[]');
+              return;
+            }
+
+            core.info(`Fetching review comments for PR #${prNumber}`);
+
+            try {
+              // Fetch all review comments (paginated)
+              const comments = await github.paginate(
+                github.rest.pulls.listReviewComments,
+                {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: prNumber
+                }
+              );
+
+              const outputPath = path.join(process.env.RUNNER_TEMP, 'review-comments.json');
+              fs.writeFileSync(outputPath, JSON.stringify(comments, null, 2));
+
+              core.info(`Fetched ${comments.length} review comment(s)`);
+            } catch (error) {
+              core.error(`Failed to fetch review comments: ${error.message}`);
+              fs.writeFileSync(path.join(process.env.RUNNER_TEMP, 'review-comments.json'), '[]');
+            }
 
       - name: Set up Python
+        if: steps.security.outputs.allowed == 'true' && steps.config.outputs.enabled == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
       - name: Install dependencies
+        if: steps.security.outputs.allowed == 'true' && steps.config.outputs.enabled == 'true'
         run: pip install -r requirements.txt
 
       - name: Run fix agent
+        if: steps.security.outputs.allowed == 'true' && steps.config.outputs.enabled == 'true'
         id: fix
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           echo "changes=no" >> $GITHUB_OUTPUT
           if [ ! -s "$RUNNER_TEMP/review-comments.json" ] || [ "$(cat "$RUNNER_TEMP/review-comments.json")" = "[]" ]; then
             echo "No review comments to process."
             exit 0
           fi
-          if [ -z "$OPENROUTER_API_KEY" ] && [ -z "$OPENAI_API_KEY" ]; then
-            echo "Set OPENAI_API_KEY or OPENROUTER_API_KEY as a repository secret to enable the agent."
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "Set ANTHROPIC_API_KEY as a repository secret to enable the agent."
             exit 0
           fi
-          python scripts/fix_review_agent.py --comments "$RUNNER_TEMP/review-comments.json" --repo-root . || true
+          python scripts/fix_review_agent.py \
+            --comments "$RUNNER_TEMP/review-comments.json" \
+            --repo-root . \
+            --model "${{ steps.config.outputs.model }}" \
+            --min-confidence "${{ steps.config.outputs.confidence_threshold }}" \
+            || true
           if ! git diff --quiet || ! git diff --staged --quiet; then
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -106,8 +249,15 @@ jobs:
           fi
 
       - name: Comment on PR (optional)
-        if: steps.fix.outputs.changes == 'yes' && steps.pr.outputs.pr_number != ''
-        run: |
-          gh pr comment ${{ steps.pr.outputs.pr_number }} --body "🤖 **Code review fixes applied** — changes have been committed to this branch."
-        env:
-          GH_TOKEN: ${{ env.GH_TOKEN }}
+        if: steps.fix.outputs.changes == 'yes' && steps.pr_and_comments.outputs.pr_number != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = parseInt('${{ steps.pr_and_comments.outputs.pr_number }}');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body: '🤖 **Code review fixes applied** — changes have been committed to this branch.'
+            });
+            core.info(`Posted comment on PR #${prNumber}`);
