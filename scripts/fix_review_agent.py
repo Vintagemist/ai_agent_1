@@ -299,7 +299,6 @@ Rules:
         text = text.strip()
 
         # Parse JSON response
-        import json
         result = json.loads(text)
 
         fixed_code = result.get("fixed_code", "").strip()
