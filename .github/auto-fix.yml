@@ -1,0 +1,69 @@
+
+# Auto-fix PR review comments configuration
+
+# Enable/disable the agent
+enabled: true
+
+# Trigger options
+triggers:
+  # Magic keywords in comments that opt-in to auto-fix
+  keywords:
+    - "@auto-fix"
+    - "/fix"
+    - "[auto-fix]"
+
+  # PR labels that enable auto-fix for all comments
+  labels:
+    - "auto-fix-enabled"
+
+  # Auto-apply to all review comments (disable for opt-in only)
+  auto_apply: false
+
+# File filters
+include:
+  - "**/*.js"
+  - "**/*.ts"
+  - "**/*.jsx"
+  - "**/*.tsx"
+  - "**/*.py"
+  - "**/*.java"
+  - "**/*.go"
+  - "**/*.rb"
+  - "**/*.php"
+  - "**/*.c"
+  - "**/*.cpp"
+  - "**/*.rs"
+  - "**/*.swift"
+  - "**/*.kt"
+  - "**/*.scala"
+
+exclude:
+  - "**/*.min.js"
+  - "**/*.min.css"
+  - "**/dist/**"
+  - "**/build/**"
+  - "**/node_modules/**"
+  - "**/*.lock"
+  - "**/package-lock.json"
+  - "**/yarn.lock"
+  - "**/Cargo.lock"
+  - "**/poetry.lock"
+
+# AI settings
+ai:
+  model: "claude-opus-4-6"
+  max_tokens: 4096
+  temperature: 0.2
+  confidence_threshold: "medium"  # Only apply high/medium confidence fixes
+
+# Safety limits
+limits:
+  max_comments_per_pr: 20
+  max_file_size_bytes: 1048576  # 1MB
+  max_lines_per_comment: 100
+
+# Notifications
+notifications:
+  on_success: true
+  on_failure: true
+  mention_reviewer: true
